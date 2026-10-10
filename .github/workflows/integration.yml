@@ -1,4 +1,4 @@
-name: Integration Tests
+name: BLS regression validation (PR 1969)
 
 on:
   workflow_dispatch:
@@ -44,11 +44,12 @@ jobs:
 
     permissions:
       contents: read
+      actions: read
       checks: write
       packages: write
 
     with:
-      test_name: "Integration Tests"
+      test_name: "BLS regression validation (PR 1969)"
       test_command: "run-tests"
       is_pr_comment: ${{ github.event_name == 'issue_comment' }}
       pr_number: ${{ github.event.issue.number || '' }}

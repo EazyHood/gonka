@@ -97,134 +97,32 @@ jobs:
             exit 1
           fi
           
+          # Fork-only diagnostic: keep official build/test steps and run the changed class.
+          # This run is targeted BLS validation, not the full integration matrix.
+          TEST_CLASSES='"BLSDKGSuccessTest"'
           # Format the output as a JSON array for the matrix
           echo "matrix={\"test_group\":[${TEST_CLASSES}]}" >> $GITHUB_OUTPUT
           echo "Generated matrix: {\"test_group\":[${TEST_CLASSES}]}"
 
   build-images:
+    name: Verify unchanged production source for existing image artifacts
     runs-on: ubuntu-latest
     steps:
-      - name: Check initial disk space
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Verify source against original successful image build
+        shell: bash
         run: |
-          echo "=== Disk Space Before Cleanup ==="
-          df -h
-
-      - name: Free up disk space on runner
-        run: |
-          echo "Removing large pre-installed tools..."
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          echo "Cleaning up apt and docker..."
-          sudo docker system prune -af --volumes
-          sudo apt-get clean
-          echo "=== Disk Space After Cleanup ==="
-          df -h
-
-      - name: Checkout code
-        uses: actions/checkout@v3
-        with:
-          ref: ${{ inputs.is_pr_comment && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
-
-      - name: Set up Docker (Latest Version)
-        uses: docker/setup-docker-action@v4
-        with:
-          version: 'latest'
-
-      - name: Verify Docker Installation
-        run: |
-          docker --version
-          docker compose version
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install Make
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y make
-
-      - name: Set up Java
-        uses: actions/setup-java@v3
-        with:
-          distribution: 'temurin'
-          java-version: '19'
-
-      - name: Set up Gradle (with caching)
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          cache-read-only: false
-
-      - name: Make Docker Images
-        env:
-          GENESIS_OVERRIDES_FILE: "inference-chain/test_genesis_overrides.json"
-          USE_REGISTRY_CACHE: "0"
-        run: |
-          make build-docker
-          # Host Linux binaries for Testermint:
-          # - build/devshardd: mounted into versiond (VERSIOND_OVERRIDE)
-          # - build/devshardctl: docker-cp'd into *-api for startDevshardProxy
-          # Stamp both versiond route name and BinaryVersion as "testapp" for CI
-          # (matches VERSIOND_BINARY_NAME default / local-build-pixelplex e2e convention).
-          DEVSHARD_VERSION=testapp DEVSHARD_BINARY_VERSION=testapp make devshardd-build devshardctl-build
-          echo "=== devshard version (DEVSHARD_VERSION / build/devshard-version) ==="
-          make -s print-devshard-version
-          cat build/devshard-version
-          ls -la build/devshardd build/devshardctl
-          echo "=== Images immediately after build ==="
-          docker images | head -20
-
-      - name: Save Docker Images
-        run: |
-          mkdir -p docker-images
-          docker save -o docker-images/inference-chain.tar ghcr.io/product-science/inferenced:latest
-          docker save -o docker-images/decentralized-api.tar ghcr.io/product-science/api:latest
-          docker save -o docker-images/inference-mock-server.tar inference-mock-server:latest
-          docker save -o docker-images/proxy.tar ghcr.io/product-science/proxy:latest
-          docker save -o docker-images/versiond.tar versiond:latest
-          docker save -o docker-images/testapp-server.tar testapp-server:latest
-          docker save -o docker-images/edge-api.tar edge-api:latest
-          docker save -o docker-images/edge-api-router.tar edge-api-router:latest
-          gzip docker-images/*.tar
-          echo "=== Created files ==="
-          ls -la docker-images/
-
-      - name: Upload Docker Images
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-images
-          path: docker-images/
-          retention-days: 1
-
-      - name: Upload Devshard Host Binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: devshard-host-binaries
-          path: |
-            build/devshardd
-            build/devshardctl
-            build/devshard-version
-          retention-days: 1
-
-      - name: Make Upgrade Build
-        if: ${{ inputs.enable_upgrades }}
-        run: |
-          make build-for-upgrade-tests
-          # Fix ownership of upgrade build files
-          sudo chown -R $USER:$USER public-html/ || true
-
-      - name: Upload Upgrade Build Files
-        if: ${{ inputs.enable_upgrades }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: upgrade-build-files
-          path: public-html/
-          retention-days: 1
+          set -euo pipefail
+          git diff --name-only c2c2132f22ca9f42e9217a8ed52cc65c5ba6e26d HEAD > changed-paths.txt
+          while IFS= read -r path; do
+            case "$path" in
+              testermint/src/test/kotlin/BLSDKGSuccessTest.kt|.github/workflows/integration.yml|.github/workflows/test-workflow.yml) ;;
+              *) echo "Unexpected source change: $path"; exit 1 ;;
+            esac
+          done < changed-paths.txt
+          echo "Production source is identical to run 38022194357; reusing its built images and host binaries."
 
   # This job runs the tests in parallel using the dynamically generated matrix
   # It depends on both setup-test-matrix (for the matrix) and build-images (for the Docker images)
@@ -252,12 +150,16 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: docker-images
+          run-id: 38022194357
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           path: docker-images/
 
       - name: Download Devshard Host Binaries
         uses: actions/download-artifact@v4
         with:
           name: devshard-host-binaries
+          run-id: 38022194357
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           path: build/
 
       - name: Load Docker Images
@@ -303,6 +205,8 @@ jobs:
         continue-on-error: true
         with:
           name: upgrade-build-files
+          run-id: 38022194357
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           path: public-html/
 
       - name: Start test chain
