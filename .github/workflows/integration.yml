@@ -1,0 +1,130 @@
+name: v0.2.17 review fixes
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go-tests:
+    name: ${{ matrix.dir }} ${{ matrix.id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: base-aa3c763ab, dir: inference-chain, repo: gonka-ai/gonka, sha: aa3c763ab814aa1af9694de76df6fe7dabd3ef50 }
+          - { id: pr-2325, dir: inference-chain, repo: EazyHood/gonka, sha: a5311a718b18c52f8c7a9050a7f5267dd7cb5002 }
+          - { id: pr-2326, dir: inference-chain, repo: EazyHood/gonka, sha: 5ceecb348a8bc1b62bae7290d886dc99a45e4b39 }
+          - { id: pr-2327, dir: inference-chain, repo: EazyHood/gonka, sha: 28dd02f078fec6e4c5ac8651617f127e2bf5dbd2 }
+          - { id: base-aa3c763ab, dir: decentralized-api, repo: gonka-ai/gonka, sha: aa3c763ab814aa1af9694de76df6fe7dabd3ef50 }
+          - { id: pr-2325, dir: decentralized-api, repo: EazyHood/gonka, sha: a5311a718b18c52f8c7a9050a7f5267dd7cb5002 }
+          - { id: pr-2326, dir: decentralized-api, repo: EazyHood/gonka, sha: 5ceecb348a8bc1b62bae7290d886dc99a45e4b39 }
+          - { id: base-v0218, dir: decentralized-api, repo: gonka-ai/gonka, sha: b7a4b9eaf5234f4930a92cf782cf6bf2ad761697 }
+          - { id: pr-1969-0a2bbaa4e, dir: decentralized-api, repo: EazyHood/gonka, sha: 0a2bbaa4e4486941059af9970a3da74b7512cdbc }
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ matrix.sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.9'
+          cache-dependency-path: ${{ matrix.dir }}/go.sum
+
+      - name: Revision under test
+        run: git log -1 --format='%H %s'
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.dir }}
+        run: go mod download
+
+      - name: Build
+        working-directory: ${{ matrix.dir }}
+        run: |
+          if [ "${{ matrix.dir }}" = "inference-chain" ]; then
+            go build -o ./build/inferenced ./cmd/inferenced/main.go
+          else
+            go build ./...
+          fi
+
+      - name: Run tests
+        working-directory: ${{ matrix.dir }}
+        run: |
+          set +e
+          log="$GITHUB_WORKSPACE/test-${{ matrix.dir }}-${{ matrix.id }}.log"
+          go test ./... -v > "$log" 2>&1
+          rc=$?
+          {
+            echo "### ${{ matrix.dir }} ${{ matrix.id }} (exit $rc)"
+            echo '```'
+            git log -1 --format='%H'
+            echo "tests: PASS $(grep -cE '^ *--- PASS' "$log")  FAIL $(grep -cE '^ *--- FAIL' "$log")  SKIP $(grep -cE '^ *--- SKIP' "$log")"
+            grep -E '^(ok|FAIL)[[:space:]]' "$log"
+            grep -E '^ *--- FAIL|^panic:|build failed' "$log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^(ok|FAIL)[[:space:]]|^ *--- FAIL|^panic:|build failed' "$log"
+          exit $rc
+
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-${{ matrix.dir }}-${{ matrix.id }}
+          path: test-*.log
+
+  proto:
+    name: ignite generate proto-go pr-2325
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      IGNITE_VERSION: "28.10.0"
+      IGNITE_TARBALL: "ignite_28.10.0_linux_amd64.tar.gz"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: a5311a718b18c52f8c7a9050a7f5267dd7cb5002
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.2"
+
+      - name: Install Ignite CLI
+        run: |
+          curl -fsSLo "/tmp/${IGNITE_TARBALL}" \
+            "https://github.com/ignite/cli/releases/download/v${IGNITE_VERSION}/${IGNITE_TARBALL}"
+          curl -fsSLo /tmp/ignite_checksums.txt \
+            "https://github.com/ignite/cli/releases/download/v${IGNITE_VERSION}/ignite_${IGNITE_VERSION}_checksums.txt"
+          grep " ${IGNITE_TARBALL}$" /tmp/ignite_checksums.txt | sed "s#  ${IGNITE_TARBALL}\$#  /tmp/${IGNITE_TARBALL}#" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "/tmp/${IGNITE_TARBALL}" -C "$RUNNER_TEMP/bin" ignite
+          chmod +x "$RUNNER_TEMP/bin/ignite"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Run proto-go generation
+        working-directory: ./inference-chain
+        env:
+          CI: "true"
+          DO_NOT_TRACK: "true"
+          IGNT_CONFIG_DIR: "${{ runner.temp }}/ignite-config"
+        run: |
+          mkdir -p "$IGNT_CONFIG_DIR"
+          ignite generate proto-go --yes
+
+      - name: Verify no generated changes
+        run: |
+          git log -1 --format='%H %s'
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git status --short
+            git diff --stat
+            exit 1
+          fi
+          echo "No generated changes"
